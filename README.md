@@ -92,17 +92,13 @@ Avoid installing the build toolchain into the read-only host image. Use an Arch 
 
 ### Create the Decky ZIP
 
-This repository contains a `backend/` directory from the Decky template, including a `Dockerfile`. Y.A.S.P.'s actual Python backend is the root-level `main.py`; it does not use that template backend directory. The Decky CLI treats any `backend/Dockerfile` as a custom backend and tries to build it. Temporarily move the unused template directory out of the way while packaging, restoring it even if the build fails:
+Y.A.S.P.'s Python backend is the root-level `main.py`; the Decky CLI includes it directly and does not need a separate backend build. Build the ZIP from the repository root:
 
 ```bash
-(
-  mv backend backend.template
-  trap 'mv backend.template backend' EXIT
-  sudo -E ./cli/decky plugin build "$PWD"
-)
+sudo -E ./cli/decky plugin build "$PWD"
 ```
 
-The repository's `.vscode/build.sh` also invokes the CLI with `sudo -E`. If your Docker-compatible engine is already accessible without elevated privileges and the build does not hit file-permission errors, you can omit `sudo -E`. After a successful build, look in `out/` for the plugin ZIP. Check that the archive contains the plugin directory with `dist/index.js`, `main.py`, `plugin.json`, `package.json`, `README.md`, and `LICENSE`. Give the downloaded release asset a versioned name (for example `YASP-v0.2.0.zip`) when attaching it to a GitHub Release; keep the ZIP's internal plugin layout unchanged.
+The repository's `.vscode/build.sh` invokes the CLI with `sudo -E` as well. If your Docker-compatible engine is already accessible without elevated privileges and the build does not hit file-permission errors, you can omit `sudo -E`. After a successful build, look in `out/` for the plugin ZIP. Check that the archive contains the plugin directory with `dist/index.js`, `main.py`, `plugin.json`, `package.json`, `README.md`, and `LICENSE`. Give the downloaded release asset a versioned name (for example `YASP-v0.2.0.zip`) when attaching it to a GitHub Release; keep the ZIP's internal plugin layout unchanged.
 
 If the frontend build in the CLI container fails while removing `node_modules/.pnpm` with a permission error, rerun the ZIP build with `sudo -E` as above. If the Podman Docker API reports buildx/buildkit errors, verify `docker info` and the `DOCKER_HOST` socket first; the CLI requires a working Docker-compatible build engine.
 
