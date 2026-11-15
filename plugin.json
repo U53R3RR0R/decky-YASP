@@ -1,11 +1,11 @@
 {
-  "name": "YASP - Yet Another Sunshine Plugin",
+  "name": "YASP - Live Streaming Plugin",
   "author": "U53R3RR0R",
   "flags": [],
   "api_version": 1,
   "publish": {
-    "tags": ["streaming", "moonlight", "sunshine", "linux"],
-    "description": "Manage Sunshine streaming for Moonlight clients from Decky Game Mode.",
-    "image": "https://opengraph.githubassets.com/1/SunshineStream/Sunshine"
+    "tags": ["streaming", "webrtc", "rtmp", "linux"],
+    "description": "Capture and stream a Linux Game Mode display to LAN WebRTC and live streaming destinations.",
+    "image": "https://opengraph.githubassets.com/1/U53R3RR0R/decky-YASP"
   }
 }
