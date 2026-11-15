@@ -1,14 +1,14 @@
 {
   "name": "decky-yasp",
   "version": "0.1.0",
-  "description": "Yet Another Sunshine Plugin for Moonlight on Steam Deck and Linux Game Mode.",
+  "description": "Decky live streaming plugin for Linux Game Mode.",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w",
-    "test": "echo \"No automated tests configured\""
+    "test": "python3 -m unittest discover -s tests -v"
   },
-  "keywords": ["decky", "sunshine", "moonlight", "steam", "streaming"],
+  "keywords": ["decky", "steam", "streaming", "webrtc", "rtmp", "linux"],
   "license": "BSD-3-Clause",
   "devDependencies": {
     "@decky/rollup": "^1.0.2",
