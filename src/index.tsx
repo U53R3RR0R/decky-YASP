@@ -9,7 +9,7 @@ import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { FaDesktop } from "react-icons/fa";
 
 type Quality = "low" | "balanced" | "high";
-type Destination = "none" | "twitch" | "youtube" | "custom_rtmp" | "custom_rtsp";
+type Destination = "none" | "twitch" | "youtube" | "restream" | "custom_rtmp" | "custom_rtsp";
 
 type Settings = {
   resolution: string;
@@ -26,6 +26,7 @@ type Status = {
   host_available: boolean;
   host: string | null;
   ffmpeg_available: boolean;
+  ffmpeg_bundled_available: boolean;
   lan_ip: string | null;
   webrtc_url: string | null;
   destination_configured: boolean;
@@ -40,6 +41,7 @@ const saveSettings = callable<[settings: Settings & { custom_url?: string; strea
 const startHost = callable<[], Status>("start_host");
 const stopHost = callable<[], Status>("stop_host");
 const downloadHost = callable<[], { installed: boolean; host: string; version: string }>("download_host");
+const downloadFfmpeg = callable<[], { installed: boolean; ffmpeg: string; version: string }>("download_ffmpeg");
 
 const initialSettings: Settings = {
   resolution: "1920x1080",
@@ -115,11 +117,14 @@ function Content() {
   };
   const labelStyle: CSSProperties = { display: "block", marginBottom: 12 };
   const disabled = busy || status?.active === true;
-  const needsStreamKey = settings.destination === "twitch" || settings.destination === "youtube";
+  const needsStreamKey =
+    settings.destination === "twitch" ||
+    settings.destination === "youtube" ||
+    settings.destination === "restream";
   const needsCustomUrl = settings.destination === "custom_rtmp" || settings.destination === "custom_rtsp";
 
   return (
-    <PanelSection title="YASP · Live Streaming">
+    <PanelSection title="Y.A.S.P. · Yet Another Streaming Plugin">
       <PanelSectionRow>
         <div style={{ width: "100%" }}>
           <div style={{ marginBottom: 10 }}>
@@ -140,11 +145,12 @@ function Content() {
               </div>
             ) : null}
             {!status?.ffmpeg_available ? (
-              <div style={{ marginTop: 6 }}>FFmpeg is required in the user's environment to capture and encode.</div>
+              <div style={{ marginTop: 6 }}>FFmpeg is missing; install the portable build below or install it in the user's environment.</div>
             ) : null}
             {status?.running && settings.destination !== "none" ? (
               <div style={{ marginTop: 6 }}>
-                External publishing is best-effort; MediaMTX/WebRTC remains available if the destination disconnects.
+                MediaMTX forwards the stream to the selected destination. Configure multiple sites in Restream.io
+                to send to several services at once.
               </div>
             ) : null}
           </div>
@@ -169,6 +175,15 @@ function Content() {
               Download portable MediaMTX host
             </ButtonItem>
           ) : null}
+          {!status?.ffmpeg_bundled_available ? (
+            <ButtonItem
+              layout="below"
+              disabled={busy || status?.active === true}
+              onClick={() => void run(downloadFfmpeg, "Portable FFmpeg installed")}
+            >
+              Install portable FFmpeg (GPLv3 build)
+            </ButtonItem>
+          ) : null}
         </div>
       </PanelSectionRow>
 
@@ -185,6 +200,7 @@ function Content() {
               <option value="none">LAN WebRTC only</option>
               <option value="twitch">Twitch</option>
               <option value="youtube">YouTube</option>
+              <option value="restream">Restream.io</option>
               <option value="custom_rtmp">Custom RTMP / RTMPS</option>
               <option value="custom_rtsp">Custom RTSP / RTSPS</option>
             </select>
@@ -192,7 +208,11 @@ function Content() {
 
           {needsStreamKey ? (
             <label style={labelStyle}>
-              {settings.destination === "twitch" ? "Twitch" : "YouTube"} stream key
+              {settings.destination === "twitch"
+                ? "Twitch"
+                : settings.destination === "youtube"
+                  ? "YouTube"
+                  : "Restream.io"} stream key
               <input
                 style={fieldStyle}
                 type="password"
@@ -214,7 +234,13 @@ function Content() {
                 autoComplete="new-password"
                 value={customUrl}
                 disabled={disabled}
-                placeholder={status?.destination_configured ? "Saved; leave blank to keep it" : "rtmp(s):// or rtsp(s)://"}
+                placeholder={
+                  status?.destination_configured
+                    ? "Saved; leave blank to keep it"
+                    : settings.destination === "custom_rtmp"
+                      ? "rtmp(s)://host/app/stream-key"
+                      : "rtsp(s)://host/path"
+                }
                 onChange={(event) => setCustomUrl(event.currentTarget.value)}
               />
             </label>
@@ -242,9 +268,16 @@ function Content() {
               disabled={disabled}
               onChange={(event) => update("resolution", event.currentTarget.value)}
             >
-              {["1280x720", "1920x1080", "2560x1440", "3840x2160"].map((resolution) => (
-                <option key={resolution} value={resolution}>{resolution}</option>
-              ))}
+              <optgroup label="16:9">
+                {["1280x720", "1600x900", "1920x1080"].map((resolution) => (
+                  <option key={resolution} value={resolution}>{resolution}</option>
+                ))}
+              </optgroup>
+              <optgroup label="16:10">
+                {["1280x800", "1440x900", "1920x1200"].map((resolution) => (
+                  <option key={resolution} value={resolution}>{resolution}</option>
+                ))}
+              </optgroup>
             </select>
           </label>
 
@@ -301,9 +334,11 @@ function Content() {
 
       <PanelSectionRow>
         <div style={{ width: "100%", opacity: 0.8, fontSize: "0.9em" }}>
-          Full display capture currently requires an X11 session, x11grab-enabled FFmpeg, xdpyinfo, and a
-          PulseAudio/PipeWire monitor. Wayland portal capture is not implemented; startup reports this instead
-          of silently streaming a partial or blank screen.
+          RTSP over UDP publishes the local low-latency feed to MediaMTX; MediaMTX serves LAN WebRTC and
+          forwards compatible codecs directly to your selected destination without a second video encode.
+          Full display capture currently requires X11 and the dependencies listed in the README.
+          The optional portable FFmpeg build is downloaded from BtbN's FFmpeg-Builds release and its GPLv3
+          license documents are stored with the plugin.
         </div>
       </PanelSectionRow>
     </PanelSection>
@@ -311,8 +346,8 @@ function Content() {
 }
 
 export default definePlugin(() => ({
-  name: "YASP Live",
-  titleView: <div className={staticClasses.Title}>YASP · Live Streaming</div>,
+  name: "Y.A.S.P.",
+  titleView: <div className={staticClasses.Title}>Y.A.S.P. · Yet Another Streaming Plugin</div>,
   content: <Content />,
   icon: <FaDesktop />,
 }));

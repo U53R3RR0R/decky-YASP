@@ -1,7 +1,7 @@
 {
   "name": "decky-yasp",
   "version": "0.1.0",
-  "description": "Decky live streaming plugin for Linux Game Mode.",
+  "description": "Y.A.S.P. - Yet Another Streaming Plugin for Linux Game Mode.",
   "type": "module",
   "scripts": {
     "build": "rollup -c",

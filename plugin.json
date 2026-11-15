@@ -1,11 +1,11 @@
 {
-  "name": "YASP - Live Streaming Plugin",
+  "name": "Y.A.S.P. - Yet Another Streaming Plugin",
   "author": "U53R3RR0R",
   "flags": [],
   "api_version": 1,
   "publish": {
-    "tags": ["streaming", "webrtc", "rtmp", "linux"],
-    "description": "Capture and stream a Linux Game Mode display to LAN WebRTC and live streaming destinations.",
+    "tags": ["streaming", "webrtc", "rtmp", "linux", "restream"],
+    "description": "Yet Another Streaming Plugin: capture Linux Game Mode and stream through MediaMTX.",
     "image": "https://opengraph.githubassets.com/1/U53R3RR0R/decky-YASP"
   }
 }
