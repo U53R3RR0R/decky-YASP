@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import ipaddress
 import json
 import os
@@ -12,7 +13,7 @@ import tempfile
 import threading
 import urllib.error
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
@@ -21,7 +22,17 @@ import decky
 
 class Plugin:
     MEDIA_REPO = "https://api.github.com/repos/bluenviron/mediamtx/releases/latest"
-    RESOLUTIONS = {"1280x720", "1920x1080", "2560x1440", "3840x2160"}
+    FFMPEG_REPO = "https://api.github.com/repos/FFmpeg-Builds/FFmpeg-Builds/releases/latest"
+    FFMPEG_MAX_ARCHIVE_SIZE = 200 * 1024 * 1024
+    FFMPEG_MAX_BINARY_SIZE = 750 * 1024 * 1024
+    RESOLUTIONS = {
+        "1280x720",
+        "1600x900",
+        "1920x1080",
+        "1280x800",
+        "1440x900",
+        "1920x1200",
+    }
     QUALITY_PRESETS = {
         "low": "ultrafast",
         "balanced": "veryfast",
@@ -69,7 +80,7 @@ class Plugin:
             quality = defaults["quality"]
 
         destination = values.get("destination")
-        if destination not in ("none", "twitch", "youtube", "custom_rtmp", "custom_rtsp"):
+        if destination not in ("none", "twitch", "youtube", "restream", "custom_rtmp", "custom_rtsp"):
             destination = "none"
 
         def bounded_int(name: str, minimum: int, maximum: int) -> int:
@@ -117,6 +128,167 @@ class Plugin:
             if candidate.is_file() and os.access(candidate, os.X_OK):
                 return str(candidate)
         return None
+
+    def _bundled_ffmpeg_path(self) -> str | None:
+        candidate = self.bin_dir / "ffmpeg"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        return None
+
+    def _ffmpeg_path(self) -> str | None:
+        return self._bundled_ffmpeg_path() or shutil.which("ffmpeg")
+
+    @classmethod
+    def _ffmpeg_release_asset(cls, release: dict[str, Any], machine: str) -> tuple[dict[str, Any], str] | None:
+        architecture = {
+            "x86_64": "64",
+            "amd64": "64",
+            "aarch64": "arm64",
+            "arm64": "arm64",
+        }.get(machine.lower())
+        if architecture is None:
+            return None
+
+        pattern = re.compile(
+            rf"ffmpeg-n(?P<major>\d+)\.(?P<minor>\d+)-latest-linux{architecture}"
+            r"-gpl-(?P<release>\d+\.\d+)\.tar\.xz"
+        )
+        candidates = []
+        for asset in release.get("assets", []):
+            name = asset.get("name")
+            if not isinstance(name, str):
+                continue
+            match = pattern.fullmatch(name)
+            size = asset.get("size", 0)
+            digest = asset.get("digest", "")
+            url = asset.get("browser_download_url", "")
+            if (
+                match
+                and isinstance(size, int)
+                and 0 < size <= cls.FFMPEG_MAX_ARCHIVE_SIZE
+                and isinstance(digest, str)
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+                and url == f"https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/{name}"
+            ):
+                version = f"{match.group('major')}.{match.group('minor')}"
+                if match.group("release") == version:
+                    candidates.append(((int(match.group("major")), int(match.group("minor"))), asset, version))
+        if not candidates:
+            return None
+        _, asset, version = max(candidates, key=lambda candidate: candidate[0])
+        return asset, version
+
+    def _download_ffmpeg(self) -> dict[str, Any]:
+        existing = self._bundled_ffmpeg_path()
+        if existing:
+            return {"installed": True, "ffmpeg": Path(existing).name, "version": "already installed"}
+
+        request = urllib.request.Request(
+            self.FFMPEG_REPO,
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "YASP-Decky-Plugin"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                release = json.load(response)
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"Could not check FFmpeg releases: {error}") from error
+
+        machine = platform.machine().lower()
+        selected = self._ffmpeg_release_asset(release, machine)
+        if selected is None:
+            raise RuntimeError(f"No supported, checksummed FFmpeg GPL release was found for {machine}.")
+        asset, version = selected
+
+        self.bin_dir.mkdir(parents=True, exist_ok=True)
+        destination = self.bin_dir / "ffmpeg"
+        expected_digest = asset["digest"].removeprefix("sha256:")
+        digest = hashlib.sha256()
+        try:
+            with tempfile.TemporaryDirectory(prefix="ffmpeg-", dir=self.bin_dir) as temporary_dir:
+                temporary_path = Path(temporary_dir)
+                archive_path = temporary_path / "release.tar.xz"
+                downloaded_size = 0
+                download_request = urllib.request.Request(
+                    asset["browser_download_url"], headers={"User-Agent": "YASP-Decky-Plugin"}
+                )
+                with urllib.request.urlopen(download_request, timeout=120) as response:
+                    with archive_path.open("wb") as downloaded:
+                        while chunk := response.read(1024 * 1024):
+                            downloaded_size += len(chunk)
+                            if downloaded_size > self.FFMPEG_MAX_ARCHIVE_SIZE:
+                                raise RuntimeError("The FFmpeg release archive exceeded the 200 MiB limit.")
+                            digest.update(chunk)
+                            downloaded.write(chunk)
+                if downloaded_size != asset["size"]:
+                    raise RuntimeError("The downloaded FFmpeg archive size did not match the release metadata.")
+                if digest.hexdigest() != expected_digest:
+                    raise RuntimeError("The downloaded FFmpeg archive failed its SHA-256 integrity check.")
+
+                temporary_binary = temporary_path / "ffmpeg"
+                license_files: list[tuple[PurePosixPath, bytes]] = []
+                with tarfile.open(archive_path, "r:xz") as archive:
+                    members = archive.getmembers()
+                    executables = [
+                        entry for entry in members
+                        if PurePosixPath(entry.name).parts[-2:] == ("bin", "ffmpeg")
+                        and entry.isfile()
+                        and 0 < entry.size <= self.FFMPEG_MAX_BINARY_SIZE
+                        and ".." not in PurePosixPath(entry.name).parts
+                    ]
+                    if len(executables) != 1:
+                        raise RuntimeError("The FFmpeg release archive did not contain exactly one safe executable.")
+                    executable = archive.extractfile(executables[0])
+                    if executable is None:
+                        raise RuntimeError("Could not read the FFmpeg executable from its release archive.")
+                    with executable, temporary_binary.open("wb") as output:
+                        shutil.copyfileobj(executable, output)
+
+                    total_license_size = 0
+                    has_gpl_license = False
+                    for entry in members:
+                        parts = PurePosixPath(entry.name).parts
+                        if not entry.isfile() or ".." in parts:
+                            continue
+                        if "doc" in parts:
+                            relative = PurePosixPath(*parts[parts.index("doc") + 1 :])
+                        elif parts and parts[-1] in ("LICENSE.txt", "COPYING.GPLv3"):
+                            relative = PurePosixPath(parts[-1])
+                        else:
+                            continue
+                        if not relative.parts or entry.size > 10 * 1024 * 1024:
+                            continue
+                        total_license_size += entry.size
+                        if total_license_size > 30 * 1024 * 1024:
+                            raise RuntimeError("The FFmpeg license documentation exceeded the 30 MiB limit.")
+                        license_stream = archive.extractfile(entry)
+                        if license_stream is None:
+                            raise RuntimeError("Could not read FFmpeg license documentation.")
+                        with license_stream:
+                            content = license_stream.read()
+                            license_files.append((relative, content))
+                        if (
+                            relative.name == "LICENSE.txt"
+                            and b"GNU GENERAL PUBLIC LICENSE" in content[:512]
+                            and b"Version 3" in content[:512]
+                        ):
+                            has_gpl_license = True
+                    if not has_gpl_license:
+                        raise RuntimeError("The FFmpeg GPL release did not contain its GPLv3 license text.")
+
+                os.chmod(temporary_binary, 0o755)
+                license_dir = self.plugin_dir / "licenses" / f"ffmpeg-{version}"
+                for relative, content in license_files:
+                    license_path = license_dir.joinpath(*relative.parts)
+                    license_path.parent.mkdir(parents=True, exist_ok=True)
+                    license_path.write_bytes(content)
+                os.replace(temporary_binary, destination)
+        except (OSError, urllib.error.URLError, tarfile.TarError) as error:
+            raise RuntimeError(f"Could not install portable FFmpeg: {error}") from error
+
+        return {"installed": True, "ffmpeg": destination.name, "version": version}
+
+    async def download_ffmpeg(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._download_ffmpeg)
 
     @staticmethod
     def _architecture_matches(asset_name: str, machine: str) -> bool:
@@ -218,9 +390,12 @@ class Plugin:
         if not display:
             raise RuntimeError("No X11 DISPLAY was provided to the Decky plugin process.")
 
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = self._ffmpeg_path()
         if not ffmpeg:
-            raise RuntimeError("FFmpeg is required for capture and encoding; install it in the user's environment.")
+            raise RuntimeError(
+                "FFmpeg is required for capture and encoding. Install the portable FFmpeg build from QAM "
+                "or install FFmpeg in the user's environment."
+            )
         devices = subprocess.run(
             [ffmpeg, "-hide_banner", "-devices"], capture_output=True, text=True, timeout=10, check=False
         )
@@ -242,8 +417,6 @@ class Plugin:
         )
         available_muxers = muxers.stdout + muxers.stderr
         required_muxers = {"rtsp"}
-        if destination is not None:
-            required_muxers.update(("tee", destination[1]))
         if any(not re.search(rf"\b{name}\b", available_muxers) for name in required_muxers):
             raise RuntimeError(f"FFmpeg must include the {', '.join(sorted(required_muxers))} muxers.")
 
@@ -280,20 +453,19 @@ class Plugin:
         destination = self.settings["destination"]
         if destination == "none":
             return None
-        if destination == "twitch":
+        if destination in ("twitch", "youtube", "restream"):
             key = self.settings["stream_key"]
             if not key:
-                raise ValueError("Enter a Twitch stream key before starting.")
+                service = {"twitch": "Twitch", "youtube": "YouTube", "restream": "Restream"}[destination]
+                raise ValueError(f"Enter a {service} stream key before starting.")
             if any(ord(character) < 32 for character in key):
-                raise ValueError("The Twitch stream key contains invalid characters.")
-            return f"rtmp://live.twitch.tv/app/{key}", "flv"
-        if destination == "youtube":
-            key = self.settings["stream_key"]
-            if not key:
-                raise ValueError("Enter a YouTube stream key before starting.")
-            if any(ord(character) < 32 for character in key):
-                raise ValueError("The YouTube stream key contains invalid characters.")
-            return f"rtmp://a.rtmp.youtube.com/live2/{key}", "flv"
+                raise ValueError("The stream key contains invalid characters.")
+            server = {
+                "twitch": "rtmp://live.twitch.tv/app",
+                "youtube": "rtmp://a.rtmp.youtube.com/live2",
+                "restream": "rtmp://live.restream.io/live",
+            }[destination]
+            return f"{server}#{key}", "rtmp"
 
         url = self.settings["custom_url"]
         expected_scheme = "rtmp" if destination == "custom_rtmp" else "rtsp"
@@ -307,19 +479,31 @@ class Plugin:
         if parsed_url.scheme.lower() not in allowed_schemes or not parsed_url.hostname:
             protocol = "RTMP/RTMPS" if expected_scheme == "rtmp" else "RTSP/RTSPS"
             raise ValueError(f"Enter a valid {protocol} publish URL.")
-        return url, "flv" if expected_scheme == "rtmp" else "rtsp"
+        if expected_scheme == "rtmp" and not parsed_url.fragment:
+            path, separator, key = parsed_url.path.rpartition("/")
+            if not separator or not key or not path:
+                raise ValueError(
+                    "Custom RTMP URLs must include an application and stream key, "
+                    "for example rtmp://host/app/stream-key."
+                )
+            url = parsed_url._replace(path=path, fragment=key).geturl()
+        return url, expected_scheme
 
-    @staticmethod
-    def _tee_escape(url: str) -> str:
-        return url.replace("\\", "\\\\").replace("|", "\\|").replace("[", "\\[").replace("]", "\\]")
-
-    def _write_mediamtx_config(self, lan_ip: str | None) -> None:
+    def _write_mediamtx_config(
+        self, lan_ip: str | None, destination: tuple[str, str] | None = None
+    ) -> None:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         address = lan_ip or "127.0.0.1"
+        forwarding = ""
+        if destination is not None:
+            forwarding = f"    forward:\n      - dest: {json.dumps(destination[0])}\n"
         config = (
             "logLevel: warn\n"
             "rtsp: yes\n"
             "rtspAddress: 127.0.0.1:8554\n"
+            "rtspTransports: [udp]\n"
+            "rtpAddress: 127.0.0.1:8000\n"
+            "rtcpAddress: 127.0.0.1:8001\n"
             "webrtc: yes\n"
             f"webrtcAddress: {address}:8889\n"
             f"webrtcLocalUDPAddress: {address}:8189\n"
@@ -328,13 +512,12 @@ class Plugin:
             "paths:\n"
             "  yasp:\n"
             "    source: publisher\n"
+            f"{forwarding}"
         )
         self.config_path.write_text(config, encoding="utf-8")
         os.chmod(self.config_path, 0o600)
 
-    def _build_stream_command(
-        self, ffmpeg: str, display: str, dimensions: str, destination: tuple[str, str] | None
-    ) -> list[str]:
+    def _build_stream_command(self, ffmpeg: str, display: str, dimensions: str) -> list[str]:
         width, height = (int(value) for value in dimensions.split("x"))
         output_width, output_height = (int(value) for value in self.settings["resolution"].split("x"))
         rotation_filters = {
@@ -392,22 +575,18 @@ class Plugin:
             "-pix_fmt",
             "yuv420p",
             "-g",
-            "120",
+            "60",
+            "-bf",
+            "0",
         ]
 
-        if destination is None:
+        if self.settings["destination"] == "none":
             command.extend([
                 "-map", "1:a:0",
                 "-c:a", "libopus",
                 "-b:a", f"{self.settings['audio_bitrate']}k",
-                "-ar", "48000",
-                "-ac", "2",
-                "-f", "rtsp",
-                "-rtsp_transport", "tcp",
-                "rtsp://127.0.0.1:8554/yasp",
             ])
         else:
-            url, container = destination
             command.extend([
                 "-map", "1:a:0",
                 "-map", "1:a:0",
@@ -420,12 +599,17 @@ class Plugin:
                 "-ar:a:1", "48000",
                 "-ac:a:1", "2",
             ])
-            local = r"[f=rtsp:rtsp_transport=tcp:select=v\\:0,a\\:1]rtsp://127.0.0.1:8554/yasp"
-            external = rf"[f={container}:onfail=ignore:select=v\\:0,a\\:0]"
-            if container == "rtsp":
-                external = r"[f=rtsp:onfail=ignore:rtsp_transport=tcp:select=v\\:0,a\\:0]"
-            tee = f"{local}|{external}{self._tee_escape(url)}"
-            command.extend(["-f", "tee", tee])
+        command.extend([
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-f",
+            "rtsp",
+            "-rtsp_transport",
+            "udp",
+            "rtsp://127.0.0.1:8554/yasp",
+        ])
         return command
 
     def _default_sink(self) -> str:
@@ -472,6 +656,7 @@ class Plugin:
                 parsed_url = None
             if parsed_url is not None:
                 secrets.update((parsed_url.username or "", parsed_url.password or ""))
+                secrets.add(parsed_url.fragment)
                 secrets.update(value for _, value in parse_qsl(parsed_url.query, keep_blank_values=False))
                 if parsed_url.path:
                     secrets.add(parsed_url.path.rsplit("/", 1)[-1])
@@ -501,7 +686,8 @@ class Plugin:
             self.stream_process = None
         running = media_running and stream_running
         active = media_running or stream_running
-        ffmpeg_available = shutil.which("ffmpeg") is not None
+        bundled_ffmpeg_available = self._bundled_ffmpeg_path() is not None
+        ffmpeg_available = self._ffmpeg_path() is not None
         lan_ip = self._lan_ip() if running else None
         return {
             "running": running,
@@ -509,10 +695,15 @@ class Plugin:
             "host_available": self._host_path() is not None,
             "host": self._host_path(),
             "ffmpeg_available": ffmpeg_available,
+            "ffmpeg_bundled_available": bundled_ffmpeg_available,
             "lan_ip": lan_ip,
             "webrtc_url": f"http://{lan_ip}:8889/yasp" if lan_ip else None,
             "destination_configured": self.settings["destination"] == "none"
-            or bool(self.settings["stream_key"] if self.settings["destination"] in ("twitch", "youtube") else self.settings["custom_url"]),
+            or bool(
+                self.settings["stream_key"]
+                if self.settings["destination"] in ("twitch", "youtube", "restream")
+                else self.settings["custom_url"]
+            ),
             "stream_error": self._recent_log_errors(),
             "settings": self._safe_settings(),
         }
@@ -554,7 +745,7 @@ class Plugin:
         ffmpeg, display, dimensions = self._capture_preflight(destination)
         lan_ip = self._lan_ip()
 
-        self._write_mediamtx_config(lan_ip)
+        self._write_mediamtx_config(lan_ip, destination)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = self.log_dir / "streaming.log"
         self.log_handle = self.log_path.open("wb")
@@ -574,7 +765,7 @@ class Plugin:
             if self.media_process.poll() is not None:
                 raise RuntimeError("MediaMTX exited during startup; check the plugin streaming.log.")
 
-            command = self._build_stream_command(ffmpeg, display, dimensions, destination)
+            command = self._build_stream_command(ffmpeg, display, dimensions)
             self.stream_process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
